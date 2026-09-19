@@ -124,6 +124,128 @@ curl -X DELETE http://localhost:8000/cleanup
 }
 ```
 
+### Assess Contract Risks Against the Rulebook
+
+```bash
+curl -X POST "http://localhost:8000/assess-risk" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"extraction_id": 7, "jurisdiction": "VIC"}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Risk assessment completed",
+  "extraction_id": 7,
+  "jurisdiction": "VIC",
+  "risks": [
+    {
+      "rule_id": "VIC-DISC-001",
+      "risk_short_desc": "Section 32 evidence missing",
+      "risk_long_desc": "Request the Section 32 statement before proceeding.",
+      "confidence_score": 92,
+      "reference": {"page_num": 2, "section_number": "3.2", "section_title": "Disclosure"},
+      "assessment_status": "Found",
+      "reviewer_status": "pending",
+      "was_edited": false
+    }
+  ],
+  "total_risks": 32,
+  "timestamp": "2026-09-18T10:00:00"
+}
+```
+
+Omit `"jurisdiction"` (or send `null`) to use the full rulebook. Re-running is free while all risks are still `pending`; once any risk is reviewed the re-run is blocked with `409`.
+
+### List Assessed Risks for an Extraction
+
+```bash
+curl "http://localhost:8000/extractions/7/risks"
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "extraction_id": 7,
+  "total_risks": 32,
+  "risks": [
+    {
+      "rule_id": "VIC-DISC-001",
+      "risk_short_desc": "Section 32 evidence missing",
+      "risk_long_desc": "Request the Section 32 statement before proceeding.",
+      "confidence_score": 92,
+      "reference": {"page_num": 2, "section_number": "3.2", "section_title": "Disclosure"},
+      "assessment_status": "Found",
+      "reviewer_status": "pending",
+      "was_edited": false
+    }
+  ]
+}
+```
+
+An extraction with no assessment yet returns `"total_risks": 0` and `"risks": []`.
+
+### Review a Risk (Approve / Reject / Edit)
+
+```bash
+# Approve
+curl -X PATCH "http://localhost:8000/risks/12" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "approve", "changed_by": "ashraf@example.com"}'
+
+# Reject
+curl -X PATCH "http://localhost:8000/risks/12" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "reject", "changed_by": "reviewer-1"}'
+
+# Edit (revised text; reviewer_status stays pending, was_edited becomes true)
+curl -X PATCH "http://localhost:8000/risks/12" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "edit", "changed_by": "ashraf@example.com",
+       "risk_short_desc": "Section 32 statement requested from vendor"}'
+```
+
+**Response** (the updated risk):
+```json
+{
+  "rule_id": "VIC-DISC-001",
+  "risk_short_desc": "Section 32 statement requested from vendor",
+  "risk_long_desc": "Request the Section 32 statement before proceeding.",
+  "confidence_score": 92,
+  "reference": {"page_num": 2, "section_number": "3.2", "section_title": "Disclosure"},
+  "assessment_status": "Found",
+  "reviewer_status": "pending",
+  "was_edited": true
+}
+```
+
+Only `pending` risks can be reviewed (`409` otherwise); `changed_by` is required.
+
+### Generate the Summary Email
+
+```bash
+curl "http://localhost:8000/extractions/7/summary-email"
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "extraction_id": 7,
+  "approved_risk_count": 2,
+  "message": "Summary email generated with 2 approved risks",
+  "email_body": "ContractIQ Risk Summary — 123 Example St, Richmond VIC 3121\n\n1. Section 32 statement missing\n   No Section 32 vendor statement was found in the contract pack. Request it from the vendor before signing.\n\n2. Finance condition and deadline unclear\n   The contract is marked subject to finance but no approval deadline is stated. Confirm the lender deadline in writing.\n\nThis review is a summary and does not replace legal advice on the full contract. Please contact us before signing.\n"
+}
+```
+
+Only `approved` risks appear. With nothing approved yet: `"approved_risk_count": 0`, `"email_body": ""`.
+
 ---
 
 ## Python Examples
@@ -249,6 +371,48 @@ def safe_convert(file_path):
         print(f"❌ Unexpected error: {str(e)}")
 
     return None
+```
+
+### Assess and Review Contract Risks
+
+```python
+import requests
+
+API = 'http://localhost:8000'
+extraction_id = 7
+
+# Assess the extraction against the rulebook (VIC scope → 32 risks)
+assess = requests.post(
+    f'{API}/assess-risk',
+    json={'extraction_id': extraction_id, 'jurisdiction': 'VIC'},
+    timeout=120
+)
+assess.raise_for_status()
+print(f"✓ Assessed {assess.json()['total_risks']} risks")
+
+# List the saved risks
+risks = requests.get(f'{API}/extractions/{extraction_id}/risks', timeout=30).json()
+for item in risks['risks'][:3]:
+    print(f"- [{item['assessment_status']}] {item['rule_id']}: {item['risk_short_desc']}")
+
+# Approve a pending risk (changed_by is required).
+# Replace risk_id with a real ContractRisk id (see the /risks list output
+# combined with your database, or the order risks were saved in).
+risk_id = 1
+review = requests.patch(
+    f'{API}/risks/{risk_id}',
+    json={'action': 'approve', 'changed_by': 'you@example.com'},
+    timeout=30
+)
+if review.status_code == 200:
+    print(f"✓ Approved (status: {review.json()['reviewer_status']})")
+elif review.status_code == 409:
+    print("! Already reviewed — only pending risks can be reviewed")
+
+# Client email from approved risks only
+email = requests.get(f'{API}/extractions/{extraction_id}/summary-email', timeout=30).json()
+print(f"✓ Email covers {email['approved_risk_count']} approved risks")
+print(email['email_body'])
 ```
 
 ---
@@ -488,6 +652,33 @@ def batch_convert(source_dir, output_dir):
 results = batch_convert('./documents', './converted')
 print(f"Successful: {len(results['successful'])}")
 print(f"Failed: {len(results['failed'])}")
+```
+
+### Workflow 3: Extract → Assess → Review → Summary Email
+
+```bash
+#!/bin/bash
+# End-to-end risk workflow for one contract. Set EXTRACTION_ID from /extract first.
+
+API_URL="http://localhost:8000"
+EXTRACTION_ID=7
+REVIEWER="you@example.com"
+
+# 1) Assess the extraction (VIC scope → 32 risks)
+curl -s -X POST "$API_URL/assess-risk" \
+  -H "Content-Type: application/json" \
+  -d "{\"extraction_id\": $EXTRACTION_ID, \"jurisdiction\": \"VIC\"}" | jq '{total_risks}'
+
+# 2) List the saved risks
+curl -s "$API_URL/extractions/$EXTRACTION_ID/risks" | jq '.risks[] | "\(.rule_id) [\(.reviewer_status)] \(.risk_short_desc)"'
+
+# 3) Approve one risk (replace 1 with a real ContractRisk id)
+curl -s -X PATCH "$API_URL/risks/1" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\": \"approve\", \"changed_by\": \"$REVIEWER\"}" | jq '{reviewer_status}'
+
+# 4) Client email from approved risks only
+curl -s "$API_URL/extractions/$EXTRACTION_ID/summary-email" | jq -r '.email_body'
 ```
 
 ---

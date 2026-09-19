@@ -23,6 +23,8 @@ from db import get_session  # noqa: E402
 
 # Always import the table models so SQLModel metadata knows about them.
 import models.contract_extract  # noqa: E402, F401
+import models.risk  # noqa: E402, F401
+import models.audit  # noqa: E402, F401
 
 
 # ---- Test database: in-memory engine overridden into the app ----

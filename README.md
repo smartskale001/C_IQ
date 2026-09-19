@@ -6,6 +6,22 @@ A **FastAPI**-based REST API that converts documents (**PDF, scanned PDF, DOCX, 
 Upload PDF/DOCX/DOC  -->  /convert  -->  Markdown  -->  /extract  -->  12 field JSON + confidence scores
 ```
 
+## Risk Assessment Workflow
+
+Once a contract is extracted, the risk pipeline runs end-to-end (mirroring the convert → extract flow above):
+
+```
+ /extract  -->  POST /assess-risk  -->  PATCH /risks/{id} (approve / reject / edit)  -->  GET /extractions/{id}/summary-email
+     |                 |                                    |                                                    |
+ extraction      32 rulebook risks saved              reviewer decision                               plain-text client email
+ stored          (VIC/NSW/all rules)                  (pending-only guard)                            (approved risks only)
+```
+
+1. **Extract** — `POST /extract` stores the 12 contract fields (returns `extraction_id`).
+2. **Assess** — `POST /assess-risk` runs every rulebook rule against the extraction and saves one `ContractRisk` row per rule (32 rows for VIC scope).
+3. **Review** — `GET /extractions/{id}/risks` lists the saved risks; `PATCH /risks/{id}` approves, rejects, or edits each risk while it is still `pending` (every action is audit-logged with the reviewer's `changed_by` identity).
+4. **Summarise** — `GET /extractions/{id}/summary-email` builds a plain-text client email from the **approved** risks only, ending with the fixed legal disclaimer.
+
 ---
 
 ## Quick Start (from scratch to running in ~5 minutes)
@@ -106,6 +122,9 @@ python main.py
 - **Multiple formats** — `.pdf` (text-based), `.pdf` (scanned, via OCR), `.docx` (Word 2007+), `.doc` (Word 97-2003)
 - **Resilient PDF pipeline** — `pdfplumber` first, then `PyPDF2` fallback, then OCR for scanned pages
 - **LLM contract extraction** — 12 predefined fields with confidence scores and section references
+- **Rulebook risk assessment** — `POST /assess-risk` scores an extraction against all 39 merged rulebook rules (VIC / NSW / Australia-wide scopes) and stores one row per rule
+- **Reviewer workflow** — list risks, then approve / reject / edit each risk while `pending`; every action is append-only audit-logged with a required `changed_by` reviewer identity
+- **Client summary email** — `GET /extractions/{id}/summary-email` renders the approved risks as numbered plain-text points ending with the fixed legal disclaimer
 - **Structured storage** — every document gets its own folder (original + Markdown) inside `tempfolder/`
 - **SQLite persistence** — all extractions stored with automatic schema migration on startup
 - **Security hardening** — filename sanitization, path-confinement (no path traversal), 50 MB upload cap, CORS allow-list, no secrets leaked in errors
@@ -430,6 +449,10 @@ Restart `python main.py` — a fresh database is recreated automatically. (The d
 | POST | `/extract` | Extract 12 contract fields from a Markdown file |
 | GET | `/extractions` | List stored extractions (newest first) |
 | GET | `/extractions/{id}` | Fetch a single extraction |
+| POST | `/assess-risk` | Assess an extraction against the rulebook (one risk row per rule) |
+| GET | `/extractions/{id}/risks` | List stored risks for an extraction (insertion order) |
+| PATCH | `/risks/{id}` | Approve, reject, or edit a single pending risk |
+| GET | `/extractions/{id}/summary-email` | Plain-text client email from approved risks only |
 
 ### Convert a document
 
@@ -498,6 +521,133 @@ Response (200):
 
 > If you extract from a **non-contract** document (e.g. a job form), fields come back `null` — that's correct behaviour, not an error.
 
+### Assess contract risks
+
+Runs every rulebook rule in scope against a stored extraction and saves one `ContractRisk` row per rule (32 rows for VIC scope: 8 VIC + 24 Australia-wide).
+
+```bash
+curl -X POST "http://localhost:8000/assess-risk" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"extraction_id": 7, "jurisdiction": "VIC"}'
+```
+
+- `jurisdiction` is optional: `"VIC"`, `"NSW"`, or omit it. An explicit override wins; otherwise the jurisdiction is derived from the extraction's stored fields; otherwise the full rulebook is used.
+- Each returned risk has `rule_id`, `risk_short_desc`, `risk_long_desc`, `confidence_score` (0-100), `reference` (page/section), `assessment_status` (`Found` | `Not Found` | `Needs Attention` | `Not Applicable`), `reviewer_status` (`pending`), and `was_edited` (`false`).
+
+Response (200, abbreviated — `risks` holds one item per rule):
+
+```json
+{
+  "success": true,
+  "message": "Risk assessment completed",
+  "extraction_id": 7,
+  "jurisdiction": "VIC",
+  "risks": [
+    {
+      "rule_id": "VIC-DISC-001",
+      "risk_short_desc": "Section 32 evidence missing",
+      "risk_long_desc": "Request the Section 32 statement before proceeding.",
+      "confidence_score": 92,
+      "reference": {"page_num": 2, "section_number": "3.2", "section_title": "Disclosure"},
+      "assessment_status": "Found",
+      "reviewer_status": "pending",
+      "was_edited": false
+    }
+  ],
+  "total_risks": 32,
+  "timestamp": "2026-09-18T10:00:00"
+}
+```
+
+**409 re-run guard** — re-running is free while existing risks are all still `pending` (untouched rows are replaced). If **any** risk for the extraction has already been reviewed (`approved`/`rejected`), the re-run is blocked with `409` to protect reviewer work, and the old audit entries are kept (audit log is append-only and never deleted).
+
+### List assessed risks
+
+```bash
+curl "http://localhost:8000/extractions/7/risks"
+```
+
+Response (200) — same `RiskItem` shape as `/assess-risk`, in insertion order:
+
+```json
+{
+  "success": true,
+  "extraction_id": 7,
+  "total_risks": 32,
+  "risks": [
+    {
+      "rule_id": "VIC-DISC-001",
+      "risk_short_desc": "Section 32 evidence missing",
+      "risk_long_desc": "Request the Section 32 statement before proceeding.",
+      "confidence_score": 92,
+      "reference": {"page_num": 2, "section_number": "3.2", "section_title": "Disclosure"},
+      "assessment_status": "Found",
+      "reviewer_status": "pending",
+      "was_edited": false
+    }
+  ]
+}
+```
+
+> If the extraction exists but no assessment has been run yet, this returns `200` with `"total_risks": 0` and `"risks": []` — an empty list, not a `404`. A `404` is only returned when the `extraction_id` itself does not exist.
+
+### Review a risk (approve / reject / edit)
+
+All three actions require the risk to still be `pending` — anything already `approved`/`rejected` returns `409`. `changed_by` (reviewer identifier, free text) is **required** on every action so the audit trail always records who decided. Edit updates the text fields and sets `was_edited: true` **without** changing `reviewer_status`; approve/reject are separate actions.
+
+Approve:
+
+```bash
+curl -X PATCH "http://localhost:8000/risks/12" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "approve", "changed_by": "ashraf@example.com"}'
+```
+
+Reject:
+
+```bash
+curl -X PATCH "http://localhost:8000/risks/12" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "reject", "changed_by": "reviewer-1"}'
+```
+
+Edit (at least one of `risk_short_desc` / `risk_long_desc` required; unchanged values are skipped):
+
+```bash
+curl -X PATCH "http://localhost:8000/risks/12" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "edit", "changed_by": "ashraf@example.com",
+       "risk_short_desc": "Section 32 statement requested from vendor"}'
+```
+
+Response (200) — the updated `RiskItem` (same shape as the `/risks` list entries), e.g. `"reviewer_status": "approved"` after an approve, or `"was_edited": true` with the revised text after an edit. Every change appends an `AuditLog` entry (`approved` / `rejected` / `edited` with `field_changed`, old `ai_value` and new `human_value` for edits).
+
+### Generate the summary email
+
+Builds a plain-text client email from the **approved** risks only — pending and rejected risks never appear. Each approved risk becomes a numbered point (`risk_short_desc` as the heading, `risk_long_desc` as the explanation), and the body always ends with the fixed disclaimer line.
+
+```bash
+curl "http://localhost:8000/extractions/7/summary-email"
+```
+
+Response (200):
+
+```json
+{
+  "success": true,
+  "extraction_id": 7,
+  "approved_risk_count": 2,
+  "message": "Summary email generated with 2 approved risks",
+  "email_body": "ContractIQ Risk Summary — 123 Example St, Richmond VIC 3121\n\n1. Section 32 statement missing\n   No Section 32 vendor statement was found in the contract pack. Request it from the vendor before signing.\n\n2. Finance condition and deadline unclear\n   The contract is marked subject to finance but no approval deadline is stated. Confirm the lender deadline in writing.\n\nThis review is a summary and does not replace legal advice on the full contract. Please contact us before signing.\n"
+}
+```
+
+> If the extraction exists but nothing is approved yet, this returns `200` with `"approved_risk_count": 0`, `"email_body": ""`, and a `message` explaining that at least one risk must be approved first — never a `404`.
+
 ---
 
 ## Testing with Swagger UI
@@ -510,9 +660,13 @@ Suggested flow:
 
 1. **POST `/convert`** — upload `test_contract.pdf`. Note the returned `markdown_file_path`.
 2. **GET `/files`** — confirm the folder was created.
-3. **POST `/extract`** — paste the exact `markdown_file_path` from step 1 into `{"markdown_file_path": "..."}`. Expect `200` with populated fields.
+3. **POST `/extract`** — paste the exact `markdown_file_path` from step 1 into `{"markdown_file_path": "..."}`. Expect `200` with populated fields. Note the returned `extraction_id`.
 4. **GET `/extractions`** / **GET `/extractions/{id}`** — see stored records.
-5. **DELETE `/cleanup`** — clear the temp folder (do this last, it deletes converted files).
+5. **POST `/assess-risk`** — send `{"extraction_id": <id from step 3>, "jurisdiction": "VIC"}`. Expect `200` with 32 risks.
+6. **GET `/extractions/{id}/risks`** — confirm the saved risks list.
+7. **PATCH `/risks/{id}`** — send `{"action": "approve", "changed_by": "you@example.com"}` on one risk; try `"edit"` with a revised `risk_short_desc` on another.
+8. **GET `/extractions/{id}/summary-email`** — see the client email built from approved risks only.
+9. **DELETE `/cleanup`** — clear the temp folder (do this last, it deletes converted files).
 
 Negative-path checks you can do in Swagger:
 
@@ -526,12 +680,21 @@ Negative-path checks you can do in Swagger:
 | `/extract` without `OPENAI_API_KEY` set | `503` |
 | `/extractions/999999` | `404` |
 | `/extractions/abc` | `422` |
+| `/assess-risk` with unknown `extraction_id` | `404` |
+| `/assess-risk` with `"jurisdiction": "TAS"` | `400` must be `VIC`, `NSW`, or omitted |
+| `/assess-risk` re-run after a risk was reviewed | `409` already reviewed |
+| `/extractions/7/risks` before any assessment | `200` with `"risks": []` (not a 404) |
+| `/risks/999999` with `PATCH` | `404` |
+| `PATCH /risks/{id}` on an approved/rejected risk | `409` only pending risks can be reviewed |
+| `PATCH /risks/{id}` with blank `changed_by` | `400` reviewer identity required |
+| `PATCH /risks/{id}` edit with no text fields | `400` requires `risk_short_desc` or `risk_long_desc` |
+| `/extractions/7/summary-email` with nothing approved | `200` with `"email_body": ""` (not a 404) |
 
 ---
 
 ## Running the Test Suite
 
-The project ships a pytest suite (11 tests) using an **in-memory SQLite database** and a **mocked OpenAI client** — no key or real network needed.
+The project ships a pytest suite (35 tests) using an **in-memory SQLite database** and a **mocked OpenAI client** — no key or real network needed.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -541,10 +704,10 @@ pytest
 Expected output:
 
 ```
-11 passed, 13 warnings in ~1-5s
+35 passed in ~1-5s
 ```
 
-What it covers: health/root endpoints, empty & corrupt PDF handling, valid conversion (PyPDF2 fallback), path-traversal blocking, temp-folder confinement, wrong-extension rejection, missing-key 503, full extraction + storage round-trip, and the extractions list endpoint.
+What it covers: health/root endpoints, empty & corrupt PDF handling, valid conversion (PyPDF2 fallback), path-traversal blocking, temp-folder confinement, wrong-extension rejection, missing-key 503, full extraction + storage round-trip, the extractions list endpoint, rulebook loading, risk-table and audit-log models, the risks list endpoint (ordering, empty list, 404), the risk review endpoint (approve / reject / edit, audit entries, 404 / 409 / 400 guards), and the summary-email endpoint (approved-only filtering, empty case, 404).
 
 ---
 
@@ -567,6 +730,28 @@ resp = requests.post(
 ).json()
 print(resp["extracted_fields"]["contract_price"])
 print(resp["extracted_parameters"])
+extraction_id = resp["extraction_id"]
+
+# Assess against the rulebook (VIC scope → 32 risks)
+assess = requests.post(
+    "http://localhost:8000/assess-risk",
+    json={"extraction_id": extraction_id, "jurisdiction": "VIC"},
+).json()
+print(assess["total_risks"])
+first_risk_id = 1  # replace with a real ContractRisk id, e.g. from GET /extractions/{id}/risks
+
+# Review: approve one risk (changed_by is required)
+review = requests.patch(
+    f"http://localhost:8000/risks/{first_risk_id}",
+    json={"action": "approve", "changed_by": "you@example.com"},
+).json()
+print(review["reviewer_status"])
+
+# Client email from approved risks only
+email = requests.get(
+    f"http://localhost:8000/extractions/{extraction_id}/summary-email"
+).json()
+print(email["email_body"])
 ```
 
 ### JavaScript (browser / node)
@@ -597,7 +782,10 @@ curl -X DELETE http://localhost:8000/cleanup
 | `400` | Unsupported file format | Use `.pdf`, `.docx`, or `.doc` |
 | `400` | Empty / malformed document | Provide a valid, un-corrupted file |
 | `400` | Extraction path invalid | `markdown_file_path` must be an existing `.md` inside `tempfolder/` |
-| `404` | Extraction not found | Request `/extractions/{id}` with a valid id |
+| `404` | Extraction / risk not found | Use a valid `extraction_id` / `risk_id` (check `/extractions` or `/extractions/{id}/risks`) |
+| `400` | Invalid jurisdiction override | `jurisdiction` must be `VIC`, `NSW`, or omitted |
+| `400` | Invalid review request | `changed_by` must be non-empty; `edit` needs `risk_short_desc` or `risk_long_desc` |
+| `409` | Already reviewed | Re-running `/assess-risk` or `PATCH`ing a non-`pending` risk is blocked to protect reviewer work |
 | `413` | File too large | Keep uploads under the 50 MB limit |
 | `422` | Validation error | Check request body/parameter format |
 | `500` | Internal conversion/extraction error | Tesseract missing (OCR), or check server logs |
@@ -609,7 +797,7 @@ curl -X DELETE http://localhost:8000/cleanup
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | *(none)* | Required for `/extract`. Missing/placeholder → `503`. |
+| `OPENAI_API_KEY` | *(none)* | Required for `/extract` and `/assess-risk`. Missing/placeholder → `503`. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 | `CORS_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Comma-separated browser-origin allow-list |
 

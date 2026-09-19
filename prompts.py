@@ -1,6 +1,10 @@
 """
-Extraction prompts for contract analysis using OpenAI GPT.
+Extraction and risk assessment prompts for contract analysis using OpenAI GPT.
 """
+
+import json
+
+from rulebook import get_rulebook
 
 EXTRACTION_INSTRUCTIONS = """You are an expert contract data extraction assistant.
 
@@ -121,3 +125,103 @@ def build_extraction_prompt(contract_markdown: str) -> str:
         Complete prompt ready for LLM
     """
     return EXTRACTION_INSTRUCTIONS.format(contract_content=contract_markdown)
+
+
+RISK_ASSESSMENT_INSTRUCTIONS = """You are an expert contract risk assessment assistant.
+
+Your task is to assess an already-extracted set of contract facts against a set of rulebook rules and report which risks apply.
+
+CRITICAL INSTRUCTIONS:
+- Return ONLY valid JSON, no explanations or markdown code fences
+- Return a JSON array with exactly one object per rule in the rulebook context below
+- Never invent a rule_id that is not present in the rulebook context
+- Assess only from the extracted fields provided; do not guess about the contract beyond them
+- If a rule cannot be assessed from the given fields because they carry no relevant information, mark it "Not Applicable" rather than guessing
+- assessment_status must be one of: "Found", "Not Found", "Needs Attention", "Not Applicable"
+- confidence_score must be an integer between 0 and 100
+
+### Assessment Rules (Rulebook)
+
+Evaluate each rule below against the extracted fields.
+
+---
+{rulebook_context}
+---
+
+### Extracted Contract Fields
+
+These are the facts already extracted from the contract. Assess the rules against them.
+
+---
+{extracted_fields}
+---
+
+### Output Format
+
+Return a JSON array. Every rule in the rulebook context above must appear exactly once, using this structure:
+
+[
+    {{
+        "rule_id": "VIC-DISC-001",
+        "risk_short_desc": "short one-line summary",
+        "risk_long_desc": "full explanation for the reviewer",
+        "confidence_score": 85,
+        "reference": {{
+            "page_num": 2,
+            "section_number": "5",
+            "section_title": "Disclosure"
+        }},
+        "assessment_status": "Found"
+    }},
+    ...
+]
+
+### RiskItem Field Guidance
+
+- rule_id: Copy it unchanged from the rulebook context. Never alter, reformat, or invent rule IDs.
+- risk_short_desc: One-line summary; also serves as the email summary and UI label.
+- risk_long_desc: Full explanation for a human reviewer, referencing the relevant extracted fields.
+- confidence_score: 0-100, your confidence in this assessment, following the same convention as extraction. A score of 0 is never valid in the output; it is reserved for system-side parse or processing failures. This applies to every assessment_status, including "Not Applicable".
+- reference: page_num, section_number, section_title where the supporting evidence lives, taken from the extracted fields (or their references); use null for any sub-field that is unknown.
+- assessment_status: "Found" if the risk condition exists; "Not Found" if the check ran and nothing adverse was found; "Needs Attention" if the evidence is ambiguous or incomplete; "Not Applicable" if the rule cannot be assessed from the given extracted fields. For "Not Applicable", risk_short_desc must give a brief contract-specific reason why the rule does not apply (e.g. "No strata scheme — standalone dwelling"), never a restatement of the rulebook's check description, and confidence_score must still be an integer of at least 1.
+
+Return ONLY the JSON array. No prose, no markdown, no additional text."""
+
+
+def build_risk_assessment_prompt(
+    extracted_fields: dict, jurisdiction: str | None = None
+) -> str:
+    """
+    Build the complete risk assessment prompt with rulebook context.
+
+    Args:
+        extracted_fields: The 12 extracted contract facts to assess
+        jurisdiction: "VIC", "NSW", or None for all rules
+
+    Returns:
+        Complete prompt ready for LLM
+    """
+    rulebook_context = get_rulebook(jurisdiction)
+    extracted_fields_json = json.dumps(extracted_fields, indent=2, default=str)
+    return RISK_ASSESSMENT_INSTRUCTIONS.format(
+        rulebook_context=rulebook_context,
+        extracted_fields=extracted_fields_json,
+    )
+
+
+if __name__ == "__main__":
+    sample_extracted_fields = {
+        "subject_to_lease": "Yes - tenanted",
+        "date_of_tenancy": "2026-11-14",
+        "contract_price": 1285000,
+        "deposit_amount": 128500,
+        "deposit_due_date": "2026-09-13",
+        "subject_to_finance": True,
+        "settlement_date": "30 days from signing",
+        "gst_clause": "Price is GST inclusive",
+        "terms_contract": "Standard terms apply",
+        "default_provisions": "Interest 12% p.a. on default",
+        "due_date_extension": None,
+        "special_conditions": None,
+    }
+    print(build_risk_assessment_prompt(sample_extracted_fields, jurisdiction="VIC"))
